@@ -111,7 +111,7 @@
             background-color: #8b5cf6; /* purple-500 */
         }
         .btn-purple:hover:not(:disabled) {
-            background-color: #7c3aed; /* purple-600 */
+            background: #7c3aed; /* purple-600 */
             transform: translateY(-1px);
         }
         .status-text {
@@ -234,7 +234,8 @@
             <p class="status-text">My Music: <span id="individualMusicStatus">OFF</span></p>
 
             <div style="margin-top: 15px;">
-                <button id="toggleSharedMusicBtn" class="btn btn-purple">Toggle Shared Music (Simulated)</button>
+                <button id="toggleSharedMusicBtn" class="btn btn-purple">Toggle Shared Music</button>
+                <input type="range" id="sharedMusicVolumeSlider" min="0" max="1" step="0.01" value="1" class="w-full mt-2">
             </div>
             <p class="status-text">Shared Music: <span id="sharedMusicStatus">OFF</span></p>
             <p id="musicDuckingStatus" class="ducking-text hidden">Music Volume Ducked (Intercom Active)</p>
@@ -264,6 +265,7 @@
         const musicDuckingStatusP = document.getElementById('musicDuckingStatus');
         const logScroll = document.getElementById('logScroll');
         const remoteAudioElement = document.getElementById('remoteAudio');
+        const sharedMusicVolumeSlider = document.getElementById('sharedMusicVolumeSlider');
 
         const signalArea = document.getElementById('signalArea');
         const signalDataTextarea = document.getElementById('signalDataTextarea');
@@ -273,85 +275,157 @@
         // --- Global WebRTC Variables ---
         let peerConnection; // RTCPeerConnection object
         let localStream;    // Local media stream (microphone)
+        let dataChannel;    // WebRTC DataChannel for music control
         let ownPeerId = generateRandomId();
         let connectionState = 'disconnected'; // WebRTC connection state
 
-        // --- Mock Audio Manager (for music, as real mixing is complex in browser) ---
-        // This class simulates the state of music playback and ducking.
-        // For actual audio mixing and individual/shared music playback, you'd integrate
-        // with the Web Audio API or dedicated audio libraries.
-        class MockAudioManager {
+        // --- Web Audio API Variables ---
+        let audioContext;
+        let micSource;
+        let remoteMicSource;
+        let individualMusicSource; // Placeholder for individual music
+        let sharedMusicAudioBuffer; // Loaded audio buffer for shared music
+        let sharedMusicSource; // AudioBufferSourceNode for shared music playback
+        let sharedMusicStartTime = 0;
+        let sharedMusicOffset = 0;
+        let isSharedMusicPlaying = false;
+        let sharedMusicGainNode; // For ducking shared music
+        let localMicGainNode; // For controlling local mic output if needed
+
+        // --- Mock Audio Manager (now interacts with Web Audio API) ---
+        class AudioManager {
             constructor() {
                 this.isIntercomActive = false; // Is the mic actively sending intercom audio?
                 this.isIndividualMusicPlaying = false; // Is local music playing?
-                this.isSharedMusicPlaying = false;   // Is shared music playing?
                 this.intercomVolume = 1.0;
-                this.musicVolume = 1.0;
-                this.sharedMusicVolume = 1.0;
+                this.musicVolume = 1.0; // Individual music volume (conceptual)
             }
 
-            // Method to update UI when music is ducked/unducked
-            updateMusicDuckingUI() {
-                if (this.isIntercomActive) {
-                    musicDuckingStatusP.classList.remove('hidden');
-                } else {
-                    musicDuckingStatusP.classList.add('hidden');
+            // Initializes the Web Audio API context and nodes
+            async initAudioContext() {
+                if (!audioContext) {
+                    audioContext = new (window.AudioContext || window.webkitAudioContext)();
+                    appendLog('AudioContext created.');
+
+                    // Create gain nodes for control and ducking
+                    sharedMusicGainNode = audioContext.createGain();
+                    // Connect shared music gain to destination (speakers)
+                    sharedMusicGainNode.connect(audioContext.destination);
+                    sharedMusicVolumeSlider.value = sharedMusicGainNode.gain.value;
+
+                    // Load shared music audio file
+                    try {
+                        // Using a royalty-free sound effect as a placeholder
+                        const audioUrl = 'https://www.soundhelix.com/examples/mp3/SoundHelix-Song-1.mp3'; // Example MP3
+                        const response = await fetch(audioUrl);
+                        const arrayBuffer = await response.arrayBuffer();
+                        sharedMusicAudioBuffer = await audioContext.decodeAudioData(arrayBuffer);
+                        appendLog('Shared music audio loaded.');
+                    } catch (error) {
+                        appendLog(`Error loading shared music: ${error}`);
+                    }
                 }
             }
 
-            // Simulates playing/pausing individual music
-            toggleIndividualMusic() {
-                this.isIndividualMusicPlaying = !this.isIndividualMusicPlaying;
-                appendLog(`Individual music: ${this.isIndividualMusicPlaying ? 'PLAYING' : 'PAUSED'}`);
-                individualMusicStatusSpan.textContent = this.isIndividualMusicPlaying ? 'PLAYING' : 'OFF';
-                this.updateMusicDuckingUI(); // Update UI for ducking status
+            // Sets up local microphone audio for WebRTC and local monitoring (optional)
+            async setupLocalMicAudio() {
+                if (localStream && audioContext && !micSource) {
+                    micSource = audioContext.createMediaStreamSource(localStream);
+                    localMicGainNode = audioContext.createGain(); // For controlling local mic output volume
+                    micSource.connect(localMicGainNode);
+                    localMicGainNode.connect(audioContext.destination); // Connect to speakers for local monitoring
+                    localMicGainNode.gain.value = 0; // Start with local mic monitoring off
+                    appendLog('Local mic audio source connected to AudioContext.');
+                }
             }
 
-            // Simulates playing/pausing shared music
-            toggleSharedMusic() {
-                this.isSharedMusicPlaying = !this.isSharedMusicPlaying;
-                appendLog(`Shared music: ${this.isSharedMusicPlaying ? 'PLAYING' : 'PAUSED'}`);
-                sharedMusicStatusSpan.textContent = this.isSharedMusicPlaying ? 'PLAYING' : 'OFF';
-                this.updateMusicDuckingUI(); // Update UI for ducking status
+            // Handles incoming remote audio stream
+            setupRemoteMicAudio(stream) {
+                if (audioContext && stream && !remoteMicSource) {
+                    remoteMicSource = audioContext.createMediaStreamSource(stream);
+                    remoteMicSource.connect(audioContext.destination); // Connect remote audio to speakers
+                    appendLog('Remote mic audio source connected to AudioContext.');
+                }
             }
 
-            // This method would conceptually control overall audio levels
-            // In a real scenario with Web Audio API, this would apply gains to various sources
+            // Toggles actual shared music playback
+            toggleSharedMusicPlayback(shouldPlay, initialOffset = 0) {
+                if (!sharedMusicAudioBuffer) {
+                    appendLog('Shared music not loaded yet.');
+                    return;
+                }
+
+                if (shouldPlay && !isSharedMusicPlaying) {
+                    if (sharedMusicSource) { // If a previous source exists, stop it
+                        sharedMusicSource.stop();
+                        sharedMusicSource.disconnect();
+                    }
+                    sharedMusicSource = audioContext.createBufferSource();
+                    sharedMusicSource.buffer = sharedMusicAudioBuffer;
+                    sharedMusicSource.connect(sharedMusicGainNode); // Connect via gain node
+                    sharedMusicSource.loop = true; // Loop the music
+                    sharedMusicSource.start(0, initialOffset);
+                    sharedMusicStartTime = audioContext.currentTime - initialOffset;
+                    isSharedMusicPlaying = true;
+                    appendLog(`Shared music started from offset: ${initialOffset.toFixed(2)}s`);
+                } else if (!shouldPlay && isSharedMusicPlaying) {
+                    if (sharedMusicSource) {
+                        sharedMusicSource.stop();
+                        sharedMusicSource.disconnect();
+                        sharedMusicSource = null;
+                        sharedMusicOffset = audioContext.currentTime - sharedMusicStartTime; // Save current position
+                    }
+                    isSharedMusicPlaying = false;
+                    appendLog('Shared music paused.');
+                }
+                this._manageAudioLevels();
+                updateUI();
+            }
+
+            // This is the core logic for mixing and ducking using GainNodes
             _manageAudioLevels() {
-                // If intercom is active, duck music volume.
-                if (this.isIntercomActive) {
-                    this.musicVolume = 0.3; // Duck music to 30%
-                    this.sharedMusicVolume = 0.3; // Duck shared music to 30%
-                } else {
-                    this.musicVolume = 1.0; // Restore music volume
-                    this.sharedMusicVolume = 1.0; // Restore shared music volume
+                // If intercom is active (mic enabled), duck music volume.
+                const targetMusicVolume = this.isIntercomActive ? 0.3 : 1.0;
+
+                // Apply ducking to shared music
+                if (sharedMusicGainNode) {
+                    sharedMusicGainNode.gain.setTargetAtTime(targetMusicVolume * sharedMusicVolumeSlider.value, audioContext.currentTime, 0.1); // Smooth transition
+                    this.musicVolume = targetMusicVolume; // Update conceptual volume
+                    this.sharedMusicVolume = targetMusicVolume; // Update conceptual volume
                 }
-                this.intercomVolume = 1.0; // Intercom always at full volume
-                appendLog(`Current conceptual audio levels: Intercom=${this.intercomVolume}, Individual Music=${this.musicVolume}, Shared Music=${this.sharedMusicVolume}`);
+
+                // If you had individual music playing via Web Audio API, you'd apply ducking here too
+                // For now, individual music is simulated, so its volume is conceptual.
+
+                appendLog(`Current audio levels: Intercom=${this.intercomVolume}, Individual Music=${this.musicVolume} (conceptual), Shared Music=${sharedMusicGainNode ? sharedMusicGainNode.gain.value : 'N/A'}`);
                 this.updateMusicDuckingUI();
             }
 
-            // Simulate starting mic for intercom (causes ducking)
-            startIntercomMic() {
-                this.isIntercomActive = true;
-                this._manageAudioLevels();
-                intercomStatusSpan.textContent = 'ACTIVE';
-                toggleIntercomBtn.textContent = 'Stop Intercom (Mic Off)';
-                toggleIntercomBtn.classList.remove('btn-green');
-                toggleIntercomBtn.classList.add('btn-red');
+            // Toggles sending local mic audio (triggers ducking)
+            toggleIntercomMic(enable) {
+                if (localStream) {
+                    localStream.getAudioTracks().forEach(track => {
+                        track.enabled = enable;
+                        this.isIntercomActive = enable;
+                    });
+                    this._manageAudioLevels(); // Re-evaluate ducking
+                    updateUI();
+                    appendLog(`Intercom mic ${enable ? 'enabled' : 'disabled'}.`);
+                } else {
+                    appendLog('Microphone stream not available to toggle.');
+                }
             }
 
-            // Simulate stopping mic for intercom (removes ducking)
-            stopIntercomMic() {
-                this.isIntercomActive = false;
-                this._manageAudioLevels();
-                intercomStatusSpan.textContent = 'OFF';
-                toggleIntercomBtn.textContent = 'Start Intercom (Mic On)';
-                toggleIntercomBtn.classList.remove('btn-red');
-                toggleIntercomBtn.classList.add('btn-green');
+            // Controls the master volume of shared music (via slider)
+            setSharedMusicMasterVolume(volume) {
+                if (sharedMusicGainNode) {
+                    sharedMusicGainNode.gain.value = volume;
+                    this._manageAudioLevels(); // Re-apply ducking on top of new master volume
+                    appendLog(`Shared music master volume set to ${volume.toFixed(2)}`);
+                }
             }
         }
-        const audioManager = new MockAudioManager();
+        const audioManager = new AudioManager();
 
 
         // --- Utility Functions ---
@@ -402,6 +476,7 @@
                     video: false // Only audio for intercom
                 });
                 localStream = stream;
+                await audioManager.setupLocalMicAudio(); // Connect mic to AudioContext
                 appendLog('Microphone access granted. Local audio stream obtained.');
                 return stream;
             } catch (error) {
@@ -426,6 +501,34 @@
             };
             peerConnection = new RTCPeerConnection(configuration);
             appendLog('RTCPeerConnection created.');
+
+            // Create DataChannel for music control
+            if (isCreator) {
+                dataChannel = peerConnection.createDataChannel("musicControl");
+                dataChannel.onopen = (event) => {
+                    appendLog('Data Channel opened!');
+                    updateUI();
+                };
+                dataChannel.onmessage = (event) => handleMusicControlMessage(event.data);
+                dataChannel.onclose = (event) => {
+                    appendLog('Data Channel closed.');
+                    updateUI();
+                };
+            } else {
+                peerConnection.ondatachannel = (event) => {
+                    dataChannel = event.channel;
+                    dataChannel.onopen = (event) => {
+                        appendLog('Data Channel opened!');
+                        updateUI();
+                    };
+                    dataChannel.onmessage = (event) => handleMusicControlMessage(event.data);
+                    dataChannel.onclose = (event) => {
+                        appendLog('Data Channel closed.');
+                        updateUI();
+                    };
+                };
+            }
+
 
             // Add local audio track to the connection
             if (!localStream) {
@@ -452,6 +555,8 @@
                     appendLog('Remote audio stream received!');
                     remoteAudioElement.srcObject = event.streams[0];
                     remoteAudioElement.play().catch(e => appendLog(`Error playing remote audio: ${e}`));
+                    // Also connect remote audio to Web Audio API for potential mixing/processing
+                    audioManager.setupRemoteMicAudio(event.streams[0]);
                     connectionState = 'connected';
                     updateUI();
                 }
@@ -501,8 +606,8 @@
                 await new Promise(r => setTimeout(r, 500)); // Give a small delay for init
             }
 
-            signalArea.classList.remove('hidden');
-            const offerText = prompt('Paste WebRTC Offer here:'); // Still use prompt for pasting input
+            // Use prompt for pasting input. The textarea is for displaying generated data.
+            const offerText = prompt('Paste WebRTC Offer here:');
             if (offerText) {
                 try {
                     const offer = JSON.parse(offerText);
@@ -515,7 +620,7 @@
                 }
             } else {
                 appendLog('No offer pasted.');
-                hideSignalData();
+                hideSignalData(); // Hide if nothing was pasted
             }
         }
 
@@ -537,8 +642,8 @@
 
         // 6. Paste Answer (for the calling party)
         async function pasteAnswer() {
-            signalArea.classList.remove('hidden');
-            const answerText = prompt('Paste WebRTC Answer here:'); // Still use prompt for pasting input
+            // Use prompt for pasting input. The textarea is for displaying generated data.
+            const answerText = prompt('Paste WebRTC Answer here:');
             if (answerText) {
                 try {
                     const answer = JSON.parse(answerText);
@@ -550,14 +655,14 @@
                 }
             } else {
                 appendLog('No answer pasted.');
-                hideSignalData();
+                hideSignalData(); // Hide if nothing was pasted
             }
         }
 
         // 7. Paste ICE Candidate
         async function pasteCandidate() {
-            signalArea.classList.remove('hidden');
-            const candidateText = prompt('Paste WebRTC ICE Candidate here:'); // Still use prompt for pasting input
+            // Use prompt for pasting input. The textarea is for displaying generated data.
+            const candidateText = prompt('Paste WebRTC ICE Candidate here:');
             if (candidateText) {
                 try {
                     const candidate = JSON.parse(candidateText);
@@ -569,10 +674,46 @@
                 }
             } else {
                 appendLog('No ICE Candidate pasted.');
-                hideSignalData();
+                hideSignalData(); // Hide if nothing was pasted
             }
         }
 
+        // --- Data Channel Handlers for Music Control ---
+        function sendMusicControlMessage(type, value) {
+            if (dataChannel && dataChannel.readyState === 'open') {
+                const message = JSON.stringify({ type, value, timestamp: audioContext.currentTime });
+                dataChannel.send(message);
+                appendLog(`Sent music control: ${message}`);
+            } else {
+                appendLog('Data Channel not open. Cannot send music control messages.');
+            }
+        }
+
+        function handleMusicControlMessage(message) {
+            try {
+                const { type, value, timestamp } = JSON.parse(message);
+                appendLog(`Received music control: Type=${type}, Value=${value}, Timestamp=${timestamp}`);
+                switch (type) {
+                    case 'play':
+                        // Calculate offset for synchronized playback
+                        const receivedTime = timestamp;
+                        const localTime = audioContext.currentTime;
+                        const offset = (localTime - receivedTime + value) % sharedMusicAudioBuffer.duration;
+                        audioManager.toggleSharedMusicPlayback(true, offset);
+                        break;
+                    case 'pause':
+                        audioManager.toggleSharedMusicPlayback(false);
+                        break;
+                    case 'volume':
+                        sharedMusicVolumeSlider.value = value;
+                        audioManager.setSharedMusicMasterVolume(parseFloat(value));
+                        break;
+                    // Add other control types if needed (e.g., seek, next song)
+                }
+            } catch (error) {
+                appendLog(`Error parsing music control message: ${error}`);
+            }
+        }
 
         // --- Event Listeners ---
         createOfferBtn.addEventListener('click', createOffer);
@@ -580,68 +721,63 @@
         pasteAnswerBtn.addEventListener('click', pasteAnswer);
         pasteCandidateBtn.addEventListener('click', pasteCandidate);
 
-        // --- Intercom Functionality ---
+        copySignalBtn.addEventListener('click', () => {
+            signalDataTextarea.select();
+            document.execCommand('copy');
+            appendLog('Signaling data copied to clipboard!');
+            hideSignalData(); // Hide after copying
+        });
+
+        // Intercom toggle button
         toggleIntercomBtn.addEventListener('click', () => {
-            if (localStream && peerConnection && peerConnection.connectionState === 'connected') {
-                // Toggle sending local audio
-                localStream.getAudioTracks().forEach(track => {
-                    track.enabled = !track.enabled;
-                    audioManager.isIntercomActive = track.enabled; // Update manager state
-                });
-                audioManager._manageAudioLevels(); // Re-evaluate ducking
-                updateUI();
-                appendLog(`Intercom mic ${localStream.getAudioTracks()[0].enabled ? 'enabled' : 'disabled'}.`);
-            } else if (peerConnection && peerConnection.connectionState !== 'connected') {
-                 appendLog('Intercom requires an active WebRTC connection.');
-            }
-            else {
-                // If localStream is not yet obtained, try to get it and then enable mic
-                getLocalStream().then(stream => {
-                    if (stream && peerConnection && peerConnection.connectionState === 'connected') {
-                        stream.getAudioTracks().forEach(track => {
-                            track.enabled = true;
-                            audioManager.isIntercomActive = true;
-                        });
-                        audioManager._manageAudioLevels();
-                        updateUI();
-                        appendLog('Microphone enabled for intercom.');
-                    } else if (!stream) {
-                         appendLog('Could not activate intercom: Microphone not available.');
-                    } else {
-                        appendLog('Intercom requires an active WebRTC connection.');
-                    }
-                });
+            if (peerConnection && peerConnection.connectionState === 'connected') {
+                const enable = !audioManager.isIntercomActive;
+                audioManager.toggleIntercomMic(enable);
+            } else {
+                appendLog('Please establish a WebRTC connection first to use intercom.');
             }
         });
 
-        // --- Music Control ---
+        // Individual Music toggle button
         toggleIndividualMusicBtn.addEventListener('click', () => {
             audioManager.toggleIndividualMusic();
             updateUI();
         });
 
+        // Shared Music toggle button
         toggleSharedMusicBtn.addEventListener('click', () => {
-            audioManager.toggleSharedMusic();
-            updateUI();
+            if (peerConnection && peerConnection.connectionState === 'connected') {
+                const shouldPlay = !isSharedMusicPlaying;
+                if (shouldPlay) {
+                    sendMusicControlMessage('play', sharedMusicOffset); // Send current offset to sync
+                } else {
+                    sendMusicControlMessage('pause', null);
+                }
+                // Also toggle locally
+                audioManager.toggleSharedMusicPlayback(shouldPlay, sharedMusicOffset);
+            } else {
+                appendLog('Please establish a WebRTC connection first to share music.');
+            }
         });
 
+        // Shared Music Volume Slider
+        sharedMusicVolumeSlider.addEventListener('input', (event) => {
+            const volume = parseFloat(event.target.value);
+            audioManager.setSharedMusicMasterVolume(volume);
+            if (dataChannel && dataChannel.readyState === 'open') {
+                sendMusicControlMessage('volume', volume); // Sync volume with other peer
+            }
+        });
 
         // --- Initial Setup on Page Load ---
         window.onload = async () => {
-            ownPeerId = generateRandomId(); // Assign an initial ID
+            ownPeerId = generateRandomId();
             ownPeerIdSpan.textContent = ownPeerId;
             updateUI();
-            appendLog('Page loaded. Ready to start WebRTC connection.');
-            appendLog('Please grant microphone permission when prompted.');
+            appendLog('Page loaded. Initializing AudioContext and loading music...');
+            await audioManager.initAudioContext(); // Initialize Web Audio API
+            appendLog('Please grant microphone permission when prompted for intercom.');
             await getLocalStream(); // Attempt to get mic access early
-        };
-
-        // Ensure UI reflects current state on load
-        audioManager.onMusicDuckedCallback = () => {
-            musicDuckingStatusP.classList.remove('hidden');
-        };
-        audioManager.onMusicUnduckedCallback = () => {
-            musicDuckingStatusP.classList.add('hidden');
         };
 
         // UI update function to keep statuses current
@@ -649,14 +785,15 @@
             connectionStatusSpan.textContent = connectionState.toUpperCase();
             connectionStatusSpan.className = connectionState === 'connected' ? 'connected-text' : '';
 
-            // Disable intercom/music controls if not connected
-            const isConnected = connectionState === 'connected';
-            toggleIntercomBtn.disabled = !isConnected;
-            toggleSharedMusicBtn.disabled = !isConnected;
+            const isConnectedAndDataChannelOpen = connectionState === 'connected' && dataChannel && dataChannel.readyState === 'open';
+
+            toggleIntercomBtn.disabled = !isConnectedAndDataChannelOpen;
+            toggleSharedMusicBtn.disabled = !isConnectedAndDataChannelOpen;
+            sharedMusicVolumeSlider.disabled = !isConnectedAndDataChannelOpen;
 
             intercomStatusSpan.textContent = audioManager.isIntercomActive ? 'ACTIVE' : 'OFF';
             individualMusicStatusSpan.textContent = audioManager.isIndividualMusicPlaying ? 'PLAYING' : 'OFF';
-            sharedMusicStatusSpan.textContent = audioManager.isSharedMusicPlaying ? 'PLAYING' : 'OFF';
+            sharedMusicStatusSpan.textContent = isSharedMusicPlaying ? 'PLAYING' : 'OFF'; // Use the global isSharedMusicPlaying
 
             toggleIntercomBtn.textContent = audioManager.isIntercomActive ? 'Stop Intercom (Mic Off)' : 'Start Intercom (Mic On)';
             toggleIntercomBtn.classList.toggle('btn-red', audioManager.isIntercomActive);
@@ -666,9 +803,9 @@
             toggleIndividualMusicBtn.classList.toggle('btn-orange', audioManager.isIndividualMusicPlaying);
             toggleIndividualMusicBtn.classList.toggle('btn-blue', !audioManager.isIndividualMusicPlaying);
 
-            toggleSharedMusicBtn.textContent = audioManager.isSharedMusicPlaying ? 'Stop Shared Music' : 'Toggle Shared Music (Simulated)';
-            toggleSharedMusicBtn.classList.toggle('btn-orange', audioManager.isSharedMusicPlaying);
-            toggleSharedMusicBtn.classList.toggle('btn-purple', !audioManager.isSharedMusicPlaying);
+            toggleSharedMusicBtn.textContent = isSharedMusicPlaying ? 'Stop Shared Music' : 'Toggle Shared Music';
+            toggleSharedMusicBtn.classList.toggle('btn-orange', isSharedMusicPlaying);
+            toggleSharedMusicBtn.classList.toggle('btn-purple', !isSharedMusicPlaying);
 
             audioManager.updateMusicDuckingUI();
         }
