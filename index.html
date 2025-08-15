@@ -154,6 +154,38 @@
         .hidden {
             display: none;
         }
+        .copy-area {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            margin-top: 15px;
+        }
+        .copy-area textarea {
+            flex-grow: 1;
+            min-height: 80px;
+            resize: vertical;
+            padding: 10px;
+            border: 1px solid #d1d5db;
+            border-radius: 8px;
+            font-size: 0.875rem;
+            background-color: #f0f4f8;
+            color: #374151;
+        }
+        .copy-btn {
+            padding: 10px 15px;
+            border-radius: 8px;
+            font-weight: 600;
+            cursor: pointer;
+            background-color: #6366f1; /* indigo-500 */
+            color: white;
+            border: none;
+            box-shadow: 0 2px 4px rgba(0, 0, 0, 0.1);
+            transition: background-color 0.3s ease, transform 0.1s ease;
+        }
+        .copy-btn:hover {
+            background-color: #4f46e5; /* indigo-600 */
+            transform: translateY(-1px);
+        }
     </style>
 </head>
 <body>
@@ -172,10 +204,18 @@
                 <button id="pasteAnswerBtn" class="btn btn-blue">Paste Answer</button>
                 <button id="pasteCandidateBtn" class="btn btn-orange">Paste ICE Candidate</button>
             </div>
+
+            <div id="signalArea" class="hidden">
+                <div class="copy-area">
+                    <textarea id="signalDataTextarea" readonly placeholder="Signaling data will appear here."></textarea>
+                    <button id="copySignalBtn" class="copy-btn">Copy</button>
+                </div>
+            </div>
+
             <p class="status-text mt-4">
                 <span class="font-bold">Instructions:</span>
                 Open this page in two separate browser tabs/devices.
-                <br>1. On Device A, click "Create Offer". Copy the generated text.
+                <br>1. On Device A, click "Create Offer". Copy the text that appears.
                 <br>2. On Device B, click "Paste Offer" and paste the text from Device A. Device B will then "Create Answer". Copy this answer text.
                 <br>3. On Device A, click "Paste Answer" and paste the answer text from Device B.
                 <br>4. During this process, both devices will generate ICE Candidates (network info). Paste any generated ICE candidates into the other device using "Paste ICE Candidate".
@@ -224,6 +264,11 @@
         const musicDuckingStatusP = document.getElementById('musicDuckingStatus');
         const logScroll = document.getElementById('logScroll');
         const remoteAudioElement = document.getElementById('remoteAudio');
+
+        const signalArea = document.getElementById('signalArea');
+        const signalDataTextarea = document.getElementById('signalDataTextarea');
+        const copySignalBtn = document.getElementById('copySignalBtn');
+
 
         // --- Global WebRTC Variables ---
         let peerConnection; // RTCPeerConnection object
@@ -325,6 +370,27 @@
             }
         }
 
+        function showSignalData(data) {
+            signalDataTextarea.value = JSON.stringify(data);
+            signalArea.classList.remove('hidden');
+        }
+
+        function hideSignalData() {
+            signalDataTextarea.value = '';
+            signalArea.classList.add('hidden');
+        }
+
+        copySignalBtn.addEventListener('click', () => {
+            document.execCommand('copy'); // Use deprecated but reliable execCommand for cross-browser clipboard access in iframes
+            appendLog('Signaling data copied to clipboard!');
+        });
+        // Add listener for copy button to actually copy the text from the textarea
+        signalDataTextarea.addEventListener('copy', (event) => {
+            event.clipboardData.setData('text/plain', signalDataTextarea.value);
+            event.preventDefault();
+        });
+
+
         // --- WebRTC Functions ---
 
         // 1. Get Local Media Stream (Mic)
@@ -375,8 +441,8 @@
             // Event handler for ICE candidates (network info)
             peerConnection.onicecandidate = (event) => {
                 if (event.candidate) {
-                    appendLog('Generated ICE Candidate. Copy and paste this into the other browser:');
-                    prompt('Generated ICE Candidate:', JSON.stringify(event.candidate));
+                    appendLog('Generated ICE Candidate. Copy this and paste into the other browser.');
+                    showSignalData(event.candidate);
                 }
             };
 
@@ -398,9 +464,11 @@
                 updateUI();
                 if (connectionState === 'connected') {
                     appendLog('Peer connection established successfully!');
+                    hideSignalData(); // Hide signaling area once connected
                 } else if (connectionState === 'failed' || connectionState === 'disconnected' || connectionState === 'closed') {
                     appendLog('WebRTC connection failed, disconnected, or closed. Please try re-initiating the connection.');
                     remoteAudioElement.srcObject = null; // Stop remote audio
+                    hideSignalData();
                 }
             };
 
@@ -419,9 +487,8 @@
             try {
                 const offer = await peerConnection.createOffer();
                 await peerConnection.setLocalDescription(offer);
-                appendLog('Offer created. Copy and paste this into the other browser:');
-                // Use alert for better visibility if prompt is blocked
-                alert('Copy this WebRTC Offer:\n\n' + JSON.stringify(offer));
+                appendLog('Offer created. Copy this and paste into the other browser.');
+                showSignalData(offer);
             } catch (error) {
                 appendLog(`Error creating offer: ${error}`);
             }
@@ -431,13 +498,11 @@
         async function pasteOffer() {
             if (!peerConnection || peerConnection.signalingState === 'closed') {
                 await initPeerConnection(false); // Initialize without creating offer
-                // Wait for the initialization to complete before processing offer
-                // A better approach would be to use promises/async-await on initPeerConnection return.
-                // For manual signaling, a slight delay might be needed if initPeerConnection is purely async.
-                await new Promise(r => setTimeout(r, 500));
+                await new Promise(r => setTimeout(r, 500)); // Give a small delay for init
             }
 
-            const offerText = prompt('Paste WebRTC Offer here:');
+            signalArea.classList.remove('hidden');
+            const offerText = prompt('Paste WebRTC Offer here:'); // Still use prompt for pasting input
             if (offerText) {
                 try {
                     const offer = JSON.parse(offerText);
@@ -450,6 +515,7 @@
                 }
             } else {
                 appendLog('No offer pasted.');
+                hideSignalData();
             }
         }
 
@@ -462,8 +528,8 @@
             try {
                 const answer = await peerConnection.createAnswer();
                 await peerConnection.setLocalDescription(answer);
-                appendLog('Answer created. Copy and paste this into the other browser:');
-                alert('Copy this WebRTC Answer:\n\n' + JSON.stringify(answer));
+                appendLog('Answer created. Copy this and paste into the other browser.');
+                showSignalData(answer);
             } catch (error) {
                 appendLog(`Error creating answer: ${error}`);
             }
@@ -471,7 +537,8 @@
 
         // 6. Paste Answer (for the calling party)
         async function pasteAnswer() {
-            const answerText = prompt('Paste WebRTC Answer here:');
+            signalArea.classList.remove('hidden');
+            const answerText = prompt('Paste WebRTC Answer here:'); // Still use prompt for pasting input
             if (answerText) {
                 try {
                     const answer = JSON.parse(answerText);
@@ -483,12 +550,14 @@
                 }
             } else {
                 appendLog('No answer pasted.');
+                hideSignalData();
             }
         }
 
         // 7. Paste ICE Candidate
         async function pasteCandidate() {
-            const candidateText = prompt('Paste WebRTC ICE Candidate here:');
+            signalArea.classList.remove('hidden');
+            const candidateText = prompt('Paste WebRTC ICE Candidate here:'); // Still use prompt for pasting input
             if (candidateText) {
                 try {
                     const candidate = JSON.parse(candidateText);
@@ -500,6 +569,7 @@
                 }
             } else {
                 appendLog('No ICE Candidate pasted.');
+                hideSignalData();
             }
         }
 
@@ -512,7 +582,7 @@
 
         // --- Intercom Functionality ---
         toggleIntercomBtn.addEventListener('click', () => {
-            if (localStream) { // Only toggle if mic stream is available
+            if (localStream && peerConnection && peerConnection.connectionState === 'connected') {
                 // Toggle sending local audio
                 localStream.getAudioTracks().forEach(track => {
                     track.enabled = !track.enabled;
@@ -521,10 +591,13 @@
                 audioManager._manageAudioLevels(); // Re-evaluate ducking
                 updateUI();
                 appendLog(`Intercom mic ${localStream.getAudioTracks()[0].enabled ? 'enabled' : 'disabled'}.`);
-            } else {
+            } else if (peerConnection && peerConnection.connectionState !== 'connected') {
+                 appendLog('Intercom requires an active WebRTC connection.');
+            }
+            else {
                 // If localStream is not yet obtained, try to get it and then enable mic
                 getLocalStream().then(stream => {
-                    if (stream) {
+                    if (stream && peerConnection && peerConnection.connectionState === 'connected') {
                         stream.getAudioTracks().forEach(track => {
                             track.enabled = true;
                             audioManager.isIntercomActive = true;
@@ -532,8 +605,10 @@
                         audioManager._manageAudioLevels();
                         updateUI();
                         appendLog('Microphone enabled for intercom.');
+                    } else if (!stream) {
+                         appendLog('Could not activate intercom: Microphone not available.');
                     } else {
-                        appendLog('Could not activate intercom: Microphone not available.');
+                        appendLog('Intercom requires an active WebRTC connection.');
                     }
                 });
             }
@@ -569,6 +644,34 @@
             musicDuckingStatusP.classList.add('hidden');
         };
 
+        // UI update function to keep statuses current
+        function updateUI() {
+            connectionStatusSpan.textContent = connectionState.toUpperCase();
+            connectionStatusSpan.className = connectionState === 'connected' ? 'connected-text' : '';
+
+            // Disable intercom/music controls if not connected
+            const isConnected = connectionState === 'connected';
+            toggleIntercomBtn.disabled = !isConnected;
+            toggleSharedMusicBtn.disabled = !isConnected;
+
+            intercomStatusSpan.textContent = audioManager.isIntercomActive ? 'ACTIVE' : 'OFF';
+            individualMusicStatusSpan.textContent = audioManager.isIndividualMusicPlaying ? 'PLAYING' : 'OFF';
+            sharedMusicStatusSpan.textContent = audioManager.isSharedMusicPlaying ? 'PLAYING' : 'OFF';
+
+            toggleIntercomBtn.textContent = audioManager.isIntercomActive ? 'Stop Intercom (Mic Off)' : 'Start Intercom (Mic On)';
+            toggleIntercomBtn.classList.toggle('btn-red', audioManager.isIntercomActive);
+            toggleIntercomBtn.classList.toggle('btn-green', !audioManager.isIntercomActive);
+
+            toggleIndividualMusicBtn.textContent = audioManager.isIndividualMusicPlaying ? 'Stop My Music' : 'Toggle My Music (Simulated)';
+            toggleIndividualMusicBtn.classList.toggle('btn-orange', audioManager.isIndividualMusicPlaying);
+            toggleIndividualMusicBtn.classList.toggle('btn-blue', !audioManager.isIndividualMusicPlaying);
+
+            toggleSharedMusicBtn.textContent = audioManager.isSharedMusicPlaying ? 'Stop Shared Music' : 'Toggle Shared Music (Simulated)';
+            toggleSharedMusicBtn.classList.toggle('btn-orange', audioManager.isSharedMusicPlaying);
+            toggleSharedMusicBtn.classList.toggle('btn-purple', !audioManager.isSharedMusicPlaying);
+
+            audioManager.updateMusicDuckingUI();
+        }
     </script>
 </body>
 </html>
